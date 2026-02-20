@@ -7,15 +7,12 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import Message
 import tempfile
-import time
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
-# Токен бота (в Render добавим как переменную окружения)
+# Токен бота из переменных окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-# Проверка токена
 if not BOT_TOKEN:
     raise ValueError("Нет токена! Добавь BOT_TOKEN в переменные окружения")
 
@@ -28,7 +25,7 @@ dp = Dispatcher()
 async def cmd_start(message: Message):
     await message.reply(
         "🎵 **Music Bot**\n\n"
-        "Привет! Отправь мне название трека, и я скачаю его с YouTube в MP3.\n\n"
+        "Отправь мне название трека, и я скачаю его с YouTube в MP3.\n\n"
         "Пример: `Imagine Dragons - Believer`\n"
         "Пример: `Daft Punk - Get Lucky`\n\n"
         "⚡️ Работает 24/7, полностью бесплатно!",
@@ -60,6 +57,7 @@ async def download_audio(query: str):
     """
     # Создаем временную папку для этого скачивания
     with tempfile.TemporaryDirectory() as temp_dir:
+        # Базовые настройки yt-dlp
         ydl_opts = {
             'format': 'bestaudio/best',
             'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
@@ -72,12 +70,21 @@ async def download_audio(query: str):
             'no_warnings': True,
             'default_search': 'ytsearch1',
             'source_address': '0.0.0.0',
-            # Ограничение размера (меньше 50 МБ для Telegram)
-            'max_filesize': 45 * 1024 * 1024,  # 45 MB
+            'max_filesize': 45 * 1024 * 1024,  # 45 MB (оставляем запас под 50 MB лимит Telegram)
         }
         
+        # Добавляем cookies если файл существует
+        cookies_path = 'cookies.txt'
+        if os.path.exists(cookies_path):
+            ydl_opts['cookiefile'] = cookies_path
+            logging.info("Using cookies file for authentication")
+        else:
+            logging.warning("No cookies file found, continuing without authentication")
+        
+        # Добавляем user-agent чтобы меньше походить на бота
+        ydl_opts['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        
         try:
-            # Показываем что ищем
             logging.info(f"Поиск: {query}")
             
             # Поиск и скачивание
@@ -85,7 +92,7 @@ async def download_audio(query: str):
                 info = ydl.extract_info(f"ytsearch1:{query}", download=True)
                 
                 if not info or 'entries' not in info or not info['entries']:
-                    return None, None, "❌ Ничего не найдено"
+                    return None, None, "❌ Ничего не найдено по запросу"
                 
                 video = info['entries'][0]
                 title = video.get('title', 'Unknown')
@@ -107,13 +114,22 @@ async def download_audio(query: str):
                         async with aiofiles.open(file_path, 'rb') as f:
                             audio_data = await f.read()
                         
+                        logging.info(f"Успешно скачано: {title} ({file_size} bytes)")
                         return audio_data, title, None
             
-            return None, None, "❌ Не удалось найти MP3 файл"
+            return None, None, "❌ Не удалось найти MP3 файл после скачивания"
             
         except Exception as e:
-            logging.error(f"Ошибка: {e}")
-            return None, None, f"❌ Ошибка: {str(e)[:100]}"
+            error_msg = str(e)
+            logging.error(f"Ошибка скачивания: {error_msg}")
+            
+            # Проверяем специфичные ошибки YouTube
+            if "Sign in to confirm you're not a bot" in error_msg:
+                return None, None, "❌ YouTube требует подтверждения. Боту нужны cookies. Инструкция: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies"
+            elif "Video unavailable" in error_msg:
+                return None, None, "❌ Видео недоступно"
+            else:
+                return None, None, f"❌ Ошибка: {error_msg[:200]}"
 
 # Обработка текстовых сообщений (поиск музыки)
 @dp.message(F.text & ~F.text.startswith('/'))
@@ -165,6 +181,9 @@ async def handle_text(message: Message):
             # Удаляем статусное сообщение
             await status_msg.delete()
             
+            # Добавляем задержку чтобы не нагружать YouTube (5 секунд)
+            await asyncio.sleep(5)
+            
         except Exception as e:
             logging.error(f"Ошибка отправки: {e}")
             await message.reply("❌ Ошибка при отправке файла. Попробуй другой трек.")
@@ -173,7 +192,7 @@ async def handle_text(message: Message):
 
 # Запуск бота
 async def main():
-    logging.info("Бот запущен!")
+    logging.info("Бот запущен и готов к работе!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
