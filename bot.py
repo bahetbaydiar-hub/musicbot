@@ -59,7 +59,8 @@ async def download_audio(query: str):
     with tempfile.TemporaryDirectory() as temp_dir:
         # Улучшенные настройки yt-dlp
         ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio/best',  # Сначала пробуем m4a, потом любой аудио
+            # Пробуем разные форматы в порядке приоритета
+            'format': 'bestaudio/best',
             'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
@@ -70,13 +71,16 @@ async def download_audio(query: str):
             'no_warnings': True,
             'default_search': 'ytsearch1',
             'source_address': '0.0.0.0',
-            'max_filesize': 45 * 1024 * 1024,  # 45 MB (оставляем запас под 50 MB лимит Telegram)
-            # Добавляем новые параметры для стабильности
+            'max_filesize': 45 * 1024 * 1024,
+            # Важные параметры для стабильности
             'ignoreerrors': True,
             'nooverwrites': True,
             'continuedl': True,
             'noplaylist': True,
             'extract_flat': False,
+            'retries': 10,
+            'fragment_retries': 10,
+            'skip_unavailable_fragments': True,
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
         
@@ -91,9 +95,8 @@ async def download_audio(query: str):
         try:
             logging.info(f"Поиск: {query}")
             
-            # Поиск и скачивание
+            # Поиск информации о видео
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Сначала ищем информацию без скачивания
                 info_dict = ydl.extract_info(f"ytsearch1:{query}", download=False)
                 
                 if not info_dict or 'entries' not in info_dict or not info_dict['entries']:
@@ -102,68 +105,94 @@ async def download_audio(query: str):
                 video_info = info_dict['entries'][0]
                 title = video_info.get('title', 'Unknown')
                 
-                # Проверяем, доступно ли видео
+                # Проверки доступности
                 if video_info.get('availability') == 'private':
                     return None, None, "❌ Это видео недоступно (приватное)"
                 
                 if video_info.get('live_status') == 'is_live':
                     return None, None, "❌ Это прямой эфир, скачивание недоступно"
                 
+                duration = video_info.get('duration', 0)
+                if duration > 900:
+                    return None, None, "❌ Видео слишком длинное (больше 15 минут)"
+                
                 logging.info(f"Найдено видео: {title}")
                 
                 # Скачиваем видео
                 ydl.download([video_info['webpage_url']])
                 
-                # Ждем завершения записи файла
-                await asyncio.sleep(3)
+                # Ждем завершения конвертации
+                await asyncio.sleep(5)
                 
-                # Ищем скачанный MP3 файл
-                mp3_files = []
-                for file in os.listdir(temp_dir):
-                    if file.endswith('.mp3'):
-                        file_path = os.path.join(temp_dir, file)
+                # Ищем скачанные файлы
+                files = os.listdir(temp_dir)
+                logging.info(f"Файлы в папке: {files}")
+                
+                # Сначала ищем MP3 файлы
+                mp3_files = [f for f in files if f.endswith('.mp3')]
+                
+                if mp3_files:
+                    # Берем первый MP3 файл
+                    file_name = mp3_files[0]
+                    file_path = os.path.join(temp_dir, file_name)
+                    file_size = os.path.getsize(file_path)
+                    
+                    if file_size < 1024:
+                        return None, None, "❌ Файл слишком маленький (менее 1 КБ)"
+                    
+                    async with aiofiles.open(file_path, 'rb') as f:
+                        audio_data = await f.read()
+                    
+                    logging.info(f"Успешно скачано: {title} ({file_size} bytes)")
+                    return audio_data, title, None
+                
+                # Если MP3 не найден, ищем другие аудиофайлы
+                audio_extensions = ['.m4a', '.webm', '.ogg', '.aac', '.wav']
+                for ext in audio_extensions:
+                    audio_files = [f for f in files if f.endswith(ext)]
+                    if audio_files:
+                        file_name = audio_files[0]
+                        file_path = os.path.join(temp_dir, file_name)
                         file_size = os.path.getsize(file_path)
-                        mp3_files.append((file_path, file_size))
-                        logging.info(f"Найден MP3 файл: {file} ({file_size} bytes)")
+                        
+                        if file_size < 1024:
+                            continue
+                        
+                        # Пробуем сконвертировать в MP3 через FFmpeg
+                        mp3_path = os.path.join(temp_dir, f"{os.path.splitext(file_name)[0]}.mp3")
+                        
+                        import subprocess
+                        try:
+                            subprocess.run([
+                                'ffmpeg', '-i', file_path, 
+                                '-codec:a', 'libmp3lame', 
+                                '-qscale:a', '2', 
+                                mp3_path
+                            ], check=True, capture_output=True)
+                            
+                            if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 1024:
+                                async with aiofiles.open(mp3_path, 'rb') as f:
+                                    audio_data = await f.read()
+                                return audio_data, title, None
+                        except Exception as e:
+                            logging.error(f"Ошибка конвертации: {e}")
                 
-                if not mp3_files:
-                    return None, None, "❌ Не удалось создать MP3 файл"
-                
-                # Берем самый большой файл (на случай если их несколько)
-                mp3_files.sort(key=lambda x: x[1], reverse=True)
-                file_path, file_size = mp3_files[0]
-                
-                # Проверяем размер
-                if file_size < 10240:  # Меньше 10 КБ - явно ошибка
-                    return None, None, "❌ Скачанный файл слишком маленький (возможно, ошибка)"
-                
-                if file_size > 50 * 1024 * 1024:  # 50 MB
-                    return None, None, "❌ Файл слишком большой (больше 50 МБ)"
-                
-                # Читаем файл
-                async with aiofiles.open(file_path, 'rb') as f:
-                    audio_data = await f.read()
-                
-                logging.info(f"Успешно скачано: {title} ({file_size} bytes)")
-                return audio_data, title, None
+                return None, None, "❌ Не удалось создать MP3 файл"
                 
         except Exception as e:
             error_msg = str(e)
             logging.error(f"Ошибка скачивания: {error_msg}")
             
-            # Проверяем специфичные ошибки
             if "Sign in to confirm you're not a bot" in error_msg:
-                return None, None, "❌ YouTube требует подтверждения. Боту нужны cookies. Инструкция: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies"
+                return None, None, "❌ YouTube требует подтверждения. Проверьте cookies"
             elif "Video unavailable" in error_msg:
                 return None, None, "❌ Видео недоступно"
-            elif "Empty file" in error_msg or "empty" in error_msg.lower():
-                return None, None, "❌ Не удалось скачать аудио. Попробуйте другой трек"
-            elif "ffmpeg not found" in error_msg.lower():
-                return None, None, "❌ Ошибка конвертации: FFmpeg не установлен"
+            elif "ffmpeg" in error_msg.lower():
+                return None, None, "❌ Ошибка конвертации. Попробуйте другой трек"
             else:
                 return None, None, f"❌ Ошибка: {error_msg[:200]}"
 
-# Обработка текстовых сообщений (поиск музыки)
+# Обработка текстовых сообщений
 @dp.message(F.text & ~F.text.startswith('/'))
 async def handle_text(message: Message):
     query = message.text.strip()
@@ -172,13 +201,9 @@ async def handle_text(message: Message):
         await message.reply("⚠️ Слишком короткий запрос. Введи хотя бы 3 символа.")
         return
     
-    # Отправляем статус "печатает..."
     await bot.send_chat_action(message.chat.id, "typing")
-    
-    # Отправляем сообщение о начале поиска
     status_msg = await message.reply(f"🔍 Ищу: *{query}*...", parse_mode="Markdown")
     
-    # Скачиваем
     audio_data, title, error = await download_audio(query)
     
     if error:
@@ -186,34 +211,24 @@ async def handle_text(message: Message):
         return
     
     if audio_data and title:
-        # Обновляем статус
         await status_msg.edit_text(f"✅ Нашел: *{title}*\n📤 Отправляю...", parse_mode="Markdown")
-        
-        # Показываем "отправка аудио"
         await bot.send_chat_action(message.chat.id, "upload_audio")
         
-        # Сохраняем во временный файл для отправки
         with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp:
             tmp.write(audio_data)
             tmp_path = tmp.name
         
         try:
-            # Отправляем аудио
             with open(tmp_path, 'rb') as audio:
                 await message.reply_audio(
                     audio,
-                    title=title[:100],  # Обрезаем если слишком длинное
+                    title=title[:100],
                     performer="YouTube",
                     caption=f"🎵 {query}"
                 )
             
-            # Удаляем временный файл
             os.unlink(tmp_path)
-            
-            # Удаляем статусное сообщение
             await status_msg.delete()
-            
-            # Добавляем задержку чтобы не нагружать YouTube (5 секунд)
             await asyncio.sleep(5)
             
         except Exception as e:
@@ -222,7 +237,6 @@ async def handle_text(message: Message):
     else:
         await status_msg.edit_text("❌ Не удалось скачать трек. Попробуй другое название.")
 
-# Запуск бота
 async def main():
     logging.info("Бот запущен и готов к работе!")
     await dp.start_polling(bot)
